@@ -14,7 +14,6 @@
 
 #include <string>
 #include <memory>
-#include <mutex>
 #include <array>
 #include <functional>
 #include <typeindex>
@@ -142,9 +141,20 @@ public:
     }
 
     // Register a serializer for a topic (required for remote distribution).
+    // Use this overload if the serializer is a long-lived object (e.g., static or 
+    // global). The DataBus does NOT take ownership.
     template <typename T>
     static void RegisterSerializer(const dmq::xstring& topic, dmq::ISerializer<void(T)>& serializer) {
-        GetInstance().InternalRegisterSerializer<T>(topic, serializer);
+        auto shared = std::shared_ptr<void>(&serializer, [](void*) {}, ::dmq::stl_allocator<void>());
+        GetInstance().InternalRegisterSerializer<T>(topic, std::move(shared));
+    }
+
+    // Register a serializer for a topic with ownership.
+    // Use this overload to allow the DataBus to manage the serializer's lifetime 
+    // through a shared_ptr.
+    template <typename T>
+    static void RegisterSerializer(const dmq::xstring& topic, std::shared_ptr<dmq::ISerializer<void(T)>> serializer) {
+        GetInstance().InternalRegisterSerializer<T>(topic, std::static_pointer_cast<void>(serializer));
     }
 
     // Register an incoming remote topic and republish received data to the local bus only.
@@ -252,7 +262,7 @@ private:
     }
 
     void InternalLastValueCache(const dmq::xstring& topic, bool enabled) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         m_topicQos[topic].lastValueCache = enabled;
     }
 
@@ -290,7 +300,7 @@ private:
         dmq::ScopedConnection conn;
 
         {
-            std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+            dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
 
             // 1. Enable LVC if requested (persists for topic lifetime until ResetForTesting)
             if (qos.lastValueCache) {
@@ -320,7 +330,7 @@ private:
         }
 
         {
-            std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+            dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
             // 4. Prepare LVC delivery if enabled and available
             if (qos.lastValueCache) {
                 auto it = m_lastValues.find(topic);
@@ -376,7 +386,7 @@ private:
         bool hasMonitor = false;
 
         {
-            std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+            dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
 
             // 1. Type safety: verify T matches the registered type for this topic.
             // Must be first — before any writes — so a mismatch never corrupts LVC.
@@ -456,7 +466,7 @@ private:
                     // Topic has remote interest but no serializer — fire once per topic.
                     bool shouldFire = false;
                     {
-                        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+                        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
                         constexpr uint8_t bit = uint8_t(1u << static_cast<int>(dmq::DelegateError::ERR_NO_SERIALIZER));
                         auto& bits = m_reportedErrors[topic];
                         if (!(bits & bit)) { bits |= bit; shouldFire = true; }
@@ -480,15 +490,15 @@ private:
         auto conn = participant->SubscribeError(
             dmq::MakeDelegate(this, &DataBus::InternalReportError));
 
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         ASSERT_TRUE(m_participantCount < dmq::MAX_PARTICIPANTS);
         m_participantErrorConnections[m_participantCount] = std::move(conn);
         m_participants[m_participantCount++] = participant;
     }
 
     template <typename T>
-    void InternalRegisterSerializer(const dmq::xstring& topic, dmq::ISerializer<void(T)>& serializer) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+    void InternalRegisterSerializer(const dmq::xstring& topic, std::shared_ptr<void> serializer) {
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
 
         auto itType = m_typeIndices.find(topic);
         if (itType != m_typeIndices.end()) {
@@ -497,12 +507,12 @@ private:
             m_typeIndices.emplace(topic, std::type_index(typeid(T)));
         }
 
-        m_serializers[topic] = std::shared_ptr<void>(&serializer, [](void*) {}, ::dmq::stl_allocator<void>());
+        m_serializers[topic] = std::move(serializer);
     }
 
     template <typename T>
     void InternalRegisterStringifier(const dmq::xstring& topic, dmq::UnicastDelegate<dmq::xstring(const T&)> func) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
 
         // Runtime Type Safety: Ensure topic is not registered with multiple types
         auto itType = m_typeIndices.find(topic);
@@ -523,7 +533,7 @@ private:
     }
 
     void InternalReset() {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         m_signals.clear();
         for (size_t i = 0; i < m_participantCount; ++i) {
             if (m_participants[i]) m_participants[i]->ResetErrors();

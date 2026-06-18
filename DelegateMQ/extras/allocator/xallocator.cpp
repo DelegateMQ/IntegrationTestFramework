@@ -83,7 +83,7 @@ struct BlockHeader {
 // and xalloc_destroy() before main exits. In all other situations
 // XallocInitDestroy must be used to call xalloc_init() and xalloc_destroy().
 #ifdef AUTOMATIC_XALLOCATOR_INIT_DESTROY
-int32_t XallocInitDestroy::refCount = 0;
+std::atomic<int32_t> XallocInitDestroy::refCount(0);
 XallocInitDestroy::XallocInitDestroy() 
 { 
 	// Track how many static instances of XallocInitDestroy are created
@@ -114,8 +114,13 @@ T nexthigher(T k)
 
 static dmq::Mutex& get_mutex()
 {
-	static dmq::Mutex _mutex;
-	return _mutex;
+	// Intentional immortal singleton: heap-allocate and never delete.
+	// A Meyers static would be destroyed during the static shutdown sequence;
+	// any static destructor that runs afterward and calls xalloc_* would then
+	// use-after-free the mutex. The heap pointer is never freed — the OS
+	// reclaims it at process exit, after all destructors have run.
+	static dmq::Mutex* _mutex = new dmq::Mutex();
+	return *_mutex;
 }
 
 #ifdef CHECK_ALIGNMENT
