@@ -36,6 +36,12 @@ elseif (DMQ_THREAD STREQUAL "DMQ_THREAD_CMSIS_RTOS2")
         "${DMQ_ROOT_DIR}/port/os/cmsis-rtos2/*.c*"
         "${DMQ_ROOT_DIR}/port/os/cmsis-rtos2/*.h"
     )
+elseif (DMQ_THREAD STREQUAL "DMQ_THREAD_NUTTX")
+    add_compile_definitions(DMQ_THREAD_NUTTX)
+    file(GLOB THREAD_SOURCES CONFIGURE_DEPENDS
+        "${DMQ_ROOT_DIR}/port/os/nuttx/*.c*"
+        "${DMQ_ROOT_DIR}/port/os/nuttx/*.h"
+    )
 elseif (DMQ_THREAD STREQUAL "DMQ_THREAD_QT")
     add_compile_definitions(DMQ_THREAD_QT)
     file(GLOB THREAD_SOURCES
@@ -150,17 +156,31 @@ endif()
 
 if (DMQ_UTIL STREQUAL "ON")
     if (DMQ_THREAD STREQUAL "DMQ_THREAD_NONE")
-        # Bare metal: Only include utilities that DON'T need mutexes
-        # Fault.cpp lives in port/fault/ and is always included separately
+        # Bare metal: only include utilities with no dmq::os::Thread/IThread
+        # dependency. Fault.cpp lives in port/fault/ and is always included
+        # separately. Timer.cpp is included -- it only needs dmq::Clock/
+        # dmq::CriticalSection (BareMetalClock.h/BareMetalCriticalSection.h
+        # exist specifically so Timer::ProcessTimers() can be driven from a
+        # hardware ISR, e.g. SysTick_Handler, with no RTOS at all -- see
+        # BareMetalCriticalSection.h's own doc comment). AsyncInvoke.h/
+        # TimerDelegate.h/RemoteDispatcher.cpp/ThreadMonitor.cpp all genuinely
+        # need a real dmq::IThread and stay excluded.
         file(GLOB UTIL_SOURCES CONFIGURE_DEPENDS
             "${DMQ_ROOT_DIR}/extras/util/Fault.h"
-            # Explicitly exclude Timer.cpp and AsyncInvoke.cpp
+            "${DMQ_ROOT_DIR}/extras/util/Timer.h"
+            "${DMQ_ROOT_DIR}/extras/util/Timer.cpp"
         )
     else()
-        # OS/RTOS present: Include everything 
+        # OS/RTOS present: Include everything
         file(GLOB UTIL_SOURCES CONFIGURE_DEPENDS
             "${DMQ_ROOT_DIR}/extras/util/*.c*"
             "${DMQ_ROOT_DIR}/extras/util/*.h"
+        )
+        # RPC sources (RemoteDispatcher/RemoteEndpoint) need a real dmq::IThread,
+        # same reasoning as the bare-metal exclusion above -- only globbed here.
+        file(GLOB RPC_SOURCES CONFIGURE_DEPENDS
+            "${DMQ_ROOT_DIR}/extras/rpc/*.c*"
+            "${DMQ_ROOT_DIR}/extras/rpc/*.h"
         )
     endif()
 endif()
@@ -191,6 +211,7 @@ set(DMQ_EXTRAS_SOURCES "")
 list(APPEND DMQ_EXTRAS_SOURCES ${DISPATCHER_SOURCES})
 list(APPEND DMQ_EXTRAS_SOURCES ${ALLOCATOR_SOURCES})
 list(APPEND DMQ_EXTRAS_SOURCES ${UTIL_SOURCES})
+list(APPEND DMQ_EXTRAS_SOURCES ${RPC_SOURCES})
 
 if (DMQ_DATABUS STREQUAL "ON")
     add_compile_definitions(DMQ_DATABUS)

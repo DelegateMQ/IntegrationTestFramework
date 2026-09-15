@@ -9,6 +9,7 @@
 #include "extras/dispatcher/RemoteChannel.h"
 #include "extras/util/Fault.h"
 #include <algorithm>
+#include <array>
 #include <string>
 #include <memory>
 #include <typeindex>
@@ -73,6 +74,7 @@ public:
         if (result == 0) {
             // Validate header marker
             if (header.GetMarker() != dmq::transport::DmqHeader::MARKER) {
+                OnChannelError(dmq::INVALID_REMOTE_ID, dmq::DelegateError::ERR_TRANSPORT_RECEIVE, 0);
                 return -1; // Protocol error
             }
 
@@ -129,7 +131,7 @@ public:
 
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
             return true;
         }
 
@@ -174,7 +176,7 @@ public:
         }
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -192,7 +194,7 @@ public:
         }
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -323,11 +325,11 @@ private:
     // --- Duplicate Filtering ---
     struct SeqHistory {
         static constexpr size_t SIZE = DMQ_SEQ_HISTORY_SIZE;
-        uint16_t buffer[SIZE];
-        bool valid[SIZE];
+        std::array<uint16_t, SIZE> buffer;
+        std::array<bool, SIZE> valid;
         size_t head = 0;
 
-        SeqHistory() { std::fill(valid, valid + SIZE, false); }
+        SeqHistory() { valid.fill(false); }
 
         bool is_duplicate(uint16_t seq) {
             for (size_t i = 0; i < SIZE; ++i) {

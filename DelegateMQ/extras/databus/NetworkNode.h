@@ -94,6 +94,19 @@ class NetworkNode {
     using ReliableTransport = dmq::util::ReliableTransport;
 
 public:
+    /// Fired when a peer's unacked-message cap is exceeded (TransportMonitor::OnCapExceeded).
+    /// Subscribers receive: (peerName, count).
+    dmq::Signal<void(const dmq::xstring&, size_t)> OnPeerCapExceeded;
+
+    /// Fired when TransportMonitor::Process() can't drain a peer's expired entries
+    /// fast enough in one pass. Subscribers receive: (peerName, remaining).
+    dmq::Signal<void(const dmq::xstring&, size_t)> OnPeerPendingExceeded;
+
+    /// Fired when a RELIABLE message to a peer exhausts its retry budget without
+    /// being ACKed — the message is now permanently abandoned.
+    /// Subscribers receive: (peerName, remoteId, seqNum).
+    dmq::Signal<void(const dmq::xstring&, dmq::DelegateRemoteId, uint16_t)> OnDeliveryFailed;
+
     NetworkNode()  = default;
     ~NetworkNode() { Stop(); }
 
@@ -187,6 +200,7 @@ public:
             if (node.unreliableParticipant) node.unreliableParticipant->SetSendThread(nullptr);
             node.capConn.Disconnect();
             node.pendingConn.Disconnect();
+            node.deliveryFailedConn.Disconnect();
             node.rawTransport.Close();
             node.active = false;
         }
@@ -204,7 +218,7 @@ public:
     void AddPeer(const char* name, const char* addr, uint16_t port)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_peerCount < MaxPeers);
+        DMQ_ASSERT_TRUE(m_peerCount < MaxPeers);
 
         RemoteNode& node = m_peers[m_peerCount];
         strncpy(node.name, name, sizeof(node.name) - 1);
@@ -234,14 +248,22 @@ public:
 
         dmq::xstring peerName(name);
         node.capConn = node.transportMonitor.OnCapExceeded.Connect(
-            dmq::MakeDelegate([peerName](size_t n) {
+            dmq::MakeDelegate([this, peerName](size_t n) {
                 printf("NetworkNode [%s]: cap exceeded (%zu unacked messages)\n",
                        peerName.c_str(), n);
+                this->OnPeerCapExceeded(peerName, n);
             }));
         node.pendingConn = node.transportMonitor.OnPendingExceeded.Connect(
-            dmq::MakeDelegate([peerName](size_t n) {
+            dmq::MakeDelegate([this, peerName](size_t n) {
                 printf("NetworkNode [%s]: pending exceeded (%zu entries remain)\n",
                        peerName.c_str(), n);
+                this->OnPeerPendingExceeded(peerName, n);
+            }));
+        node.deliveryFailedConn = node.retryMonitor.OnDeliveryFailed.Connect(
+            dmq::MakeDelegate([this, peerName](dmq::DelegateRemoteId id, uint16_t seq) {
+                printf("NetworkNode [%s]: delivery failed id=%u seq=%u (retries exhausted)\n",
+                       peerName.c_str(), id, seq);
+                this->OnDeliveryFailed(peerName, id, seq);
             }));
 
         node.reliableParticipant   = dmq::xmake_shared<Participant>(node.reliableTransport);
@@ -284,7 +306,7 @@ public:
               Reliability rel = Reliability::UNRELIABLE)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_outCount < MaxTopics);
+        DMQ_ASSERT_TRUE(m_outCount < MaxTopics);
         DataBus::RegisterSerializer<T>(topic, serializer);
         m_outTopics[m_outCount++] = {topic, remoteId, rel};
 
@@ -313,7 +335,7 @@ public:
                  dmq::ISerializer<void(T)>& serializer)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_inCount < MaxTopics);
+        DMQ_ASSERT_TRUE(m_inCount < MaxTopics);
 
         // Store a type-erased adder so it can be replayed when Start() creates the participant.
         m_inTopics[m_inCount++] = {
@@ -383,6 +405,7 @@ private:
         ReliableTransport reliableTransport;   // Init(rawTransport, retryMonitor)
         dmq::ScopedConnection capConn;
         dmq::ScopedConnection pendingConn;
+        dmq::ScopedConnection deliveryFailedConn;
         std::shared_ptr<Participant> reliableParticipant;    // xmake_shared on construction
         std::shared_ptr<Participant> unreliableParticipant;  // xmake_shared on construction
         bool active = false;

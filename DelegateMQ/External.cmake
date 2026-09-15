@@ -246,7 +246,18 @@ if(DMQ_THREAD STREQUAL "DMQ_THREAD_THREADX")
             set(THREADX_TOOLCHAIN "gnu")
         endif()
 
-        add_subdirectory("${THREADX_ROOT_DIR}" "${CMAKE_BINARY_DIR}/threadx_build")
+        # Guard against add_subdirectory() being reached more than once in the
+        # same top-level CMake project -- e.g. two executables (Cellutron's
+        # controller and safety nodes) each including DelegateMQ.cmake with
+        # DMQ_THREAD_THREADX. The "threadx" target, once created, is visible
+        # project-wide, so every caller after the first just reuses it; without
+        # this guard the second add_subdirectory() call fails outright (CMake
+        # refuses to bind the same source directory to a second binary
+        # directory, and a plain unique-binary-dir fix would still collide on
+        # the "threadx" target name itself).
+        if(NOT TARGET threadx)
+            add_subdirectory("${THREADX_ROOT_DIR}" "${CMAKE_BINARY_DIR}/threadx_build")
+        endif()
 
         # ThreadX's own ports/linux/gnu/CMakeLists.txt unconditionally adds
         # -DTX_LINUX_DEBUG_ENABLE as a PUBLIC compile definition on the
@@ -308,6 +319,25 @@ if(DMQ_THREAD STREQUAL "DMQ_THREAD_CMSIS_RTOS2")
     # CMSIS is usually provided by the IDE (Keil/IAR) or a silicon vendor pack (STM32Cube).
     # We do NOT glob sources here by default.
     # Users must ensure the 'cmsis_os2.h' path is in their include path.
+endif()
+
+# ---------------------------------------------------------------------------
+# NuttX
+# ---------------------------------------------------------------------------
+if(DMQ_THREAD STREQUAL "DMQ_THREAD_NUTTX")
+    # Like Zephyr, NuttX is a build system, not just a library -- an
+    # application is normally built as a NuttX "app" from inside a NuttX
+    # source tree (nuttx + apps repos), using NuttX's own Make-based
+    # (or, on recent versions, CMake-based) build, which already supplies
+    # the cross-toolchain and POSIX-compatible include paths (pthread.h,
+    # mqueue.h, semaphore.h, nuttx/irq.h, etc.) that this port's headers
+    # need. DelegateMQ.cmake does not vendor or fetch NuttX itself; the
+    # including project's build must already be running under a NuttX
+    # toolchain (or the `sim` simulation target) before this file is hit.
+    #
+    # Do NOT glob NuttX kernel sources here -- only DelegateMQ's own
+    # port/os/nuttx/*.cpp adapter files, already collected via
+    # Port.cmake's THREAD_SOURCES glob.
 endif()
 
 # ---------------------------------------------------------------------------

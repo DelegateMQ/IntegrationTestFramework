@@ -1,6 +1,11 @@
 #ifndef DMQ_DATABUS_H
 #define DMQ_DATABUS_H
 
+/// @file
+/// @brief Publish/subscribe message bus built on top of DelegateMQ's Signal
+/// and remote delegate infrastructure. Routes typed topics to local
+/// subscribers and, via Participant, to remote nodes.
+
 #include "delegate/Signal.h"
 #include "delegate/DelegateRemote.h"
 #include "delegate/DelegateAsync.h"
@@ -200,7 +205,7 @@ public:
     // priority without a thread is a programming error and triggers FaultHandler.
     template <typename F>
     [[nodiscard]] static dmq::ScopedConnection Monitor(F&& func, dmq::IThread* thread = nullptr, dmq::Priority priority = dmq::Priority::NORMAL) {
-        ASSERT_TRUE(thread || priority == dmq::Priority::NORMAL);
+        DMQ_ASSERT_TRUE(thread || priority == dmq::Priority::NORMAL);
 
         dmq::UnicastDelegate<void(const SpyPacket&)> ud;
         if constexpr (std::is_base_of_v<dmq::Delegate<void(const SpyPacket&)>, std::decay_t<F>>)
@@ -340,7 +345,7 @@ private:
             // Type mismatch: report through the error signal for diagnosability,
             // then hard fault (wrong type is an invariant violation).
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
             return {};
         }
 
@@ -467,7 +472,7 @@ private:
                                 // Recovery copy also failed: the slot cannot be safely
                                 // restored to a valid state. This is an unrecoverable
                                 // invariant violation, not a normal operational error.
-                                ASSERT();
+                                DMQ_ASSERT();
                             }
                             throw;
                         }
@@ -504,7 +509,7 @@ private:
 
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
             return;
         }
 
@@ -568,7 +573,15 @@ private:
             dmq::MakeDelegate(this, &DataBus::InternalReportLatchedError));
 
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_participantCount < dmq::MAX_PARTICIPANTS);
+        if (m_participantCount >= dmq::MAX_PARTICIPANTS) {
+            // Report via the error signal for diagnosability, then hard fault —
+            // same "report, then fault" hybrid as the ERR_TYPE_MISMATCH sites
+            // above. Recursive mutex allows re-entry into InternalReportLatchedError
+            // while m_mutex is already held.
+            InternalReportLatchedError("<AddParticipant>", dmq::DelegateError::ERR_CAPACITY_EXCEEDED);
+            DMQ_ASSERT();
+            return;
+        }
         m_participantErrorConnections[m_participantCount] = std::move(conn);
         participant->EnableContinuousErrors(m_continuousErrors);
         m_participants[m_participantCount++] = participant;
@@ -586,7 +599,7 @@ private:
         }
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -609,7 +622,7 @@ private:
         }
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -679,7 +692,7 @@ private:
 
     // Look up topic's registered type; if none yet, establish it as `expected`.
     // Returns true if topic was already registered with a DIFFERENT type -- a
-    // programming-error type mismatch the caller must report/ASSERT on.
+    // programming-error type mismatch the caller must report/DMQ_ASSERT on.
     bool CheckOrEstablishType(const dmq::xstring& topic, std::type_index expected) {
         auto it = m_typeIndices.find(topic);
         if (it != m_typeIndices.end())

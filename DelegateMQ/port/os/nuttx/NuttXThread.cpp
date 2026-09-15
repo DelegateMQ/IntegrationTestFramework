@@ -1,28 +1,28 @@
-#ifndef DMQ_THREAD_CMSIS_RTOS2
-#error "port/os/cmsis-rtos2/CmsisRtos2Thread.cpp requires DMQ_THREAD_CMSIS_RTOS2. Remove this file from your build configuration or define DMQ_THREAD_CMSIS_RTOS2."
+#ifndef DMQ_THREAD_NUTTX
+#error "port/os/nuttx/NuttXThread.cpp requires DMQ_THREAD_NUTTX. Remove this file from your build configuration or define DMQ_THREAD_NUTTX."
 #endif
 
 #include "DelegateMQ.h"
-#include "CmsisRtos2Thread.h"
+#include "NuttXThread.h"
 #include "port/os/common/ThreadMsg.h"
 #include "extras/util/Fault.h"
 #include <cstdio>
-#include <new>
+#include <cstring> // for memset
+#include <cassert>
 
 // Define DMQ_ASSERT_TRUE if not already defined
 #ifndef DMQ_ASSERT_TRUE
-#define DMQ_ASSERT_TRUE(x) if(!(x)) { while(1); }
+#define DMQ_ASSERT_TRUE(x) assert(x)
 #endif
 
 namespace dmq::os {
 
-using namespace dmq;
 using namespace dmq::util;
 
 //----------------------------------------------------------------------------
 // Thread Constructor
 //----------------------------------------------------------------------------
-CmsisRtos2Thread::CmsisRtos2Thread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolicy, dmq::Duration dispatchTimeout, const char* cpuName)
+NuttXThread::NuttXThread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolicy, dmq::Duration dispatchTimeout, const char* cpuName)
     : THREAD_NAME(threadName)
     , CPU_NAME(cpuName)
     , m_queueSize((maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize)
@@ -30,23 +30,30 @@ CmsisRtos2Thread::CmsisRtos2Thread(const char* threadName, size_t maxQueueSize, 
     , m_dispatchTimeout(dispatchTimeout)
     , m_exit(false)
 {
-    // Default Priority
-    m_priority = osPriorityNormal;
+    m_priority = 100; // Default SCHED_FIFO priority (NuttX default range is typically 1-255)
+
+    sem_init(&m_exitSem, 0, 0);
 
 #if defined(DMQ_DATABUS_TOOLS)
-    m_statMutex = osMutexNew(NULL);
+    pthread_mutex_init(&m_statMutex, nullptr);
 #endif
 }
 
 //----------------------------------------------------------------------------
 // Thread Destructor
 //----------------------------------------------------------------------------
-CmsisRtos2Thread::~CmsisRtos2Thread()
+NuttXThread::~NuttXThread()
 {
     ExitThread();
 
+    sem_destroy(&m_exitSem);
+
+#if defined(DMQ_DATABUS_TOOLS)
+    pthread_mutex_destroy(&m_statMutex);
+#endif
+
     const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-    CmsisRtos2Thread** pp = &GetWatchdogHead();
+    NuttXThread** pp = &GetWatchdogHead();
     while (*pp != nullptr)
     {
         if (*pp == this)
@@ -57,45 +64,40 @@ CmsisRtos2Thread::~CmsisRtos2Thread()
         }
         pp = &((*pp)->m_watchdogNext);
     }
-
-#if defined(DMQ_DATABUS_TOOLS)
-    if (m_statMutex) {
-        osMutexDelete(m_statMutex);
-        m_statMutex = NULL;
-    }
-#endif
-
-    // Cleanup semaphore if it exists
-    if (m_exitSem) {
-        osSemaphoreDelete(m_exitSem);
-        m_exitSem = NULL;
-    }
 }
 
 //----------------------------------------------------------------------------
 // CreateThread
 //----------------------------------------------------------------------------
-bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
+bool NuttXThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
-    if (m_thread == NULL)
+    if (!m_created.load())
     {
-        // 1. Create Exit Semaphore (Max 1, Initial 0)
-        // We use this to wait for the thread to shut down gracefully.
-        m_exitSem = osSemaphoreNew(1, 0, NULL);
-        DMQ_ASSERT_TRUE(m_exitSem != NULL);
-
-        // 2. Create Message Queue
+        // 1. Create the message queue
         DMQ_ASSERT_TRUE(m_queue.Create(m_queueSize));
 
-        // 3. Create Thread
-        osThreadAttr_t attr = {0};
-        attr.name = THREAD_NAME.c_str();
-        attr.stack_size = STACK_SIZE;
-        attr.priority = m_priority;
+        // 2. Create the pthread
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, STACK_SIZE);
 
-        m_thread = osThreadNew(CmsisRtos2Thread::Process, this, &attr);
-        DMQ_ASSERT_TRUE(m_thread != NULL);
+        struct sched_param sp;
+        sp.sched_priority = m_priority;
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+        pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+        pthread_attr_setschedparam(&attr, &sp);
 
+        int rc = pthread_create(&m_thread, &attr, NuttXThread::Process, this);
+        pthread_attr_destroy(&attr);
+        DMQ_ASSERT_TRUE(rc == 0);
+
+#if defined(PTHREAD_NAME_MAX) || defined(CONFIG_TASK_NAME_SIZE)
+        // NuttX supports naming a pthread for debugging (non-portable POSIX
+        // extension); harmless no-op if unsupported on a given configuration.
+        pthread_setname_np(m_thread, THREAD_NAME.c_str());
+#endif
+
+        m_created.store(true);
         m_lastAliveTime.store(Timer::GetNow());
 
         if (watchdogTimeout.has_value())
@@ -106,7 +108,7 @@ bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout
 
             // Add to watchdog registry if not already present
             bool found = false;
-            CmsisRtos2Thread* p = GetWatchdogHead();
+            NuttXThread* p = GetWatchdogHead();
             while (p != nullptr)
             {
                 if (p == this)
@@ -128,73 +130,94 @@ bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout
 }
 
 //----------------------------------------------------------------------------
-// SetThreadPriority
-//----------------------------------------------------------------------------
-void CmsisRtos2Thread::SetThreadPriority(osPriority_t priority)
-{
-    m_priority = priority;
-
-    // If the thread is already running, update it live
-    if (m_thread != NULL) {
-        osThreadSetPriority(m_thread, m_priority);
-    }
-}
-
-//----------------------------------------------------------------------------
-// GetThreadPriority
-//----------------------------------------------------------------------------
-osPriority_t CmsisRtos2Thread::GetThreadPriority()
-{
-    return m_priority;
-}
-
-//----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::ExitThread()
+void NuttXThread::ExitThread()
 {
-    if (m_queue.IsCreated())
+    if (m_created.load())
     {
         m_exit.store(true);
 
         // Check self-exit BEFORE attempting to enqueue the exit message. If
         // this thread is destroying itself from within its own dispatched
         // callback, it is not consuming its own queue right now -- it is
-        // blocked here, inside ExitThread(). A blocking osMessageQueuePut()
-        // would deadlock forever if the queue happened to be full. No message
+        // blocked here, inside ExitThread(). A blocking mq_send() would
+        // deadlock forever if the queue happened to be full. No message
         // needs to be queued in that case: Run()'s dispatch loop already
-        // checks m_selfExitPtr immediately after the current callback invoke
-        // returns, and unwinds without touching 'this' again.
-        if (osThreadGetId() == m_thread) {
+        // checks m_selfExitPtr immediately after the current callback
+        // invoke returns, and unwinds without touching 'this' again.
+        //
+        // Crucially, a self-exiting thread must NOT touch m_queue here: it
+        // is still physically executing on its own stack (unwinding back
+        // through Invoke()/Run()), and it cannot pthread_join() itself. Set
+        // the flag and return immediately; the actual cleanup (queue
+        // drain/destroy, pthread_join) is deferred to a later ExitThread()
+        // call made from a different thread context -- typically
+        // ~NuttXThread() -- once m_selfExited tells that call it's safe to
+        // skip the message/semaphore handshake below (the thread already
+        // returned/is returning on its own) and go straight to the join.
+        if (pthread_equal(pthread_self(), m_thread)) {
+            m_selfExited.store(true);
             if (m_selfExitPtr) *m_selfExitPtr = true;
-        } else {
+            return;
+        }
+
+        if (!m_selfExited.load())
+        {
             // Send exit message
             ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
             if (msg)
             {
-                // Send pointer, wait forever to ensure it gets in.
-                if (!m_queue.Send(msg, /*highPriority=*/false, osWaitForever))
+                // Wait forever to ensure message is sent
+                if (!m_queue.Send(msg, /*highPriority=*/false, NuttXDelegateQueue::WAIT_FOREVER))
                 {
-                    delete msg; // Failed to send
+                    delete msg;
                 }
             }
 
-            // Wait for thread to process the exit message and signal completion.
-            if (m_exitSem != NULL) osSemaphoreAcquire(m_exitSem, osWaitForever);
+            // Wait for thread to actually finish before joining.
+            sem_wait(&m_exitSem);
         }
 
-        // Thread has finished Run(). Now we can safely clean up resources.
-        m_thread = NULL;
+        // pthread_join() blocks until the kernel has fully torn the thread
+        // down, the race-free way to wait for that -- sem_wait() above only
+        // proves Run() is about to return, not that the kernel has finished
+        // unlinking it from scheduler structures. It is also the right call
+        // in the deferred self-exit case: the thread has already returned or
+        // is in the process of returning on its own, so this either returns
+        // immediately or waits only as long as that natural teardown takes.
+        pthread_join(m_thread, nullptr);
 
         m_queue.DrainAndDelete();
         m_queue.Destroy();
+
+        // Reset flag to mark as exited. This prevents a double-entry deadlock:
+        // ~NuttXThread() calls ExitThread() unconditionally, so if ExitThread()
+        // was already called explicitly, the second call must be a no-op.
+        m_created.store(false);
+
+        // Allow this object to be reused for a fresh CreateThread()/Run() cycle.
+        m_selfExited.store(false);
+    }
+}
+
+//----------------------------------------------------------------------------
+// SetThreadPriority
+//----------------------------------------------------------------------------
+void NuttXThread::SetThreadPriority(int priority)
+{
+    m_priority = priority;
+    if (m_created.load()) {
+        struct sched_param sp;
+        sp.sched_priority = m_priority;
+        pthread_setschedparam(m_thread, SCHED_FIFO, &sp);
     }
 }
 
 //----------------------------------------------------------------------------
 // GetThreadId
 //----------------------------------------------------------------------------
-osThreadId_t CmsisRtos2Thread::GetThreadId()
+pthread_t NuttXThread::GetThreadId()
 {
     return m_thread;
 }
@@ -202,37 +225,39 @@ osThreadId_t CmsisRtos2Thread::GetThreadId()
 //----------------------------------------------------------------------------
 // GetCurrentThreadId
 //----------------------------------------------------------------------------
-osThreadId_t CmsisRtos2Thread::GetCurrentThreadId()
+pthread_t NuttXThread::GetCurrentThreadId()
 {
-    return osThreadGetId();
+    return pthread_self();
 }
 
 //----------------------------------------------------------------------------
 // IsCurrentThread
 //----------------------------------------------------------------------------
-bool CmsisRtos2Thread::IsCurrentThread()
+bool NuttXThread::IsCurrentThread()
 {
-    return GetThreadId() == GetCurrentThreadId();
+    if (!m_created.load())
+        return false;
+    return pthread_equal(GetThreadId(), GetCurrentThreadId()) != 0;
 }
 
 //----------------------------------------------------------------------------
 // GetQueueSize
 //----------------------------------------------------------------------------
-size_t CmsisRtos2Thread::GetQueueSize()
+size_t NuttXThread::GetQueueSize()
 {
     return m_queue.Size();
 }
 
-void CmsisRtos2Thread::Sleep(dmq::Duration timeout) {
+void NuttXThread::Sleep(dmq::Duration timeout) {
     dmq::ThisThread::sleep_for(timeout);
 }
 
 //----------------------------------------------------------------------------
 // DispatchDelegate
 //----------------------------------------------------------------------------
-bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
+bool NuttXThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 {
-    DMQ_ASSERT_TRUE(m_queue.IsCreated());
+    DMQ_ASSERT_TRUE(m_created.load());
 
     // 1. Allocate message container
     ThreadMsg* threadMsg = new (std::nothrow) ThreadMsg(MSG_DISPATCH_DELEGATE, msg);
@@ -242,14 +267,14 @@ bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 #endif
 
     // 2. Send pointer to queue
-    uint32_t timeout;
+    dmq::Duration timeout;
     if (FULL_POLICY == FullPolicy::TIMEOUT)
-        timeout = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(m_dispatchTimeout).count());
+        timeout = m_dispatchTimeout;
     else
-        timeout = 0;  // DROP and FAULT: non-blocking
+        timeout = dmq::Duration::zero();  // DROP and FAULT: non-blocking
 
-    // High priority uses osMessageQueuePut's native msg_prio argument.
-    bool sent = m_queue.Send(threadMsg, msg->GetPriority() == Priority::HIGH, timeout);
+    // High priority routes through mq_send()'s native msg_prio argument.
+    bool sent = m_queue.Send(threadMsg, msg->GetPriority() == dmq::Priority::HIGH, timeout);
     if (!sent)
     {
         if (FULL_POLICY == FullPolicy::FAULT) {
@@ -258,18 +283,20 @@ bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
         } else if (FULL_POLICY == FullPolicy::TIMEOUT) {
             printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
         }
-        // Failed to send (queue full or timed out)
+        // Failed to enqueue (queue full or timed out)
         delete threadMsg;
         return false;
     }
 
 #if defined(DMQ_DATABUS_TOOLS)
     // Update monitoring stats
-    osMutexAcquire(m_statMutex, osWaitForever);
-    size_t currentDepth = GetQueueSize();
-    if (currentDepth > m_queueDepthMaxWindow) m_queueDepthMaxWindow = currentDepth;
-    if (currentDepth > m_queueDepthMaxAll) m_queueDepthMaxAll = currentDepth;
-    osMutexRelease(m_statMutex);
+    {
+        pthread_mutex_lock(&m_statMutex);
+        size_t currentDepth = GetQueueSize();
+        if (currentDepth > m_queueDepthMaxWindow) m_queueDepthMaxWindow = currentDepth;
+        if (currentDepth > m_queueDepthMaxAll) m_queueDepthMaxAll = currentDepth;
+        pthread_mutex_unlock(&m_statMutex);
+    }
 #endif
 
     return true;
@@ -278,22 +305,20 @@ bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 //----------------------------------------------------------------------------
 // Process (Static Entry Point)
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::Process(void* argument)
+void* NuttXThread::Process(void* arg)
 {
-    CmsisRtos2Thread* thread = static_cast<CmsisRtos2Thread*>(argument);
+    NuttXThread* thread = static_cast<NuttXThread*>(arg);
     if (thread)
     {
         thread->Run();
     }
-
-    // Thread terminates automatically when function returns.
-    osThreadExit();
+    return nullptr;
 }
 
 //----------------------------------------------------------------------------
 // WatchdogCheck
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::WatchdogCheck()
+void NuttXThread::WatchdogCheck()
 {
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
@@ -312,7 +337,7 @@ void CmsisRtos2Thread::WatchdogCheck()
 //----------------------------------------------------------------------------
 // ThreadCheck
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::ThreadCheck()
+void NuttXThread::ThreadCheck()
 {
     m_lastAliveTime.store(Timer::GetNow());
 }
@@ -320,10 +345,10 @@ void CmsisRtos2Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 // WatchdogCheckAll
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::WatchdogCheckAll()
+void NuttXThread::WatchdogCheckAll()
 {
     const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-    CmsisRtos2Thread* p = GetWatchdogHead();
+    NuttXThread* p = GetWatchdogHead();
     while (p != nullptr)
     {
         p->WatchdogCheck();
@@ -334,28 +359,30 @@ void CmsisRtos2Thread::WatchdogCheckAll()
 //----------------------------------------------------------------------------
 // GetWatchdogHead
 //----------------------------------------------------------------------------
-CmsisRtos2Thread*& CmsisRtos2Thread::GetWatchdogHead()
+NuttXThread*& NuttXThread::GetWatchdogHead()
 {
-    static CmsisRtos2Thread* head = nullptr;
+    static NuttXThread* head = nullptr;
     return head;
 }
 
 //----------------------------------------------------------------------------
 // GetWatchdogLock
 //----------------------------------------------------------------------------
-dmq::RecursiveMutex& CmsisRtos2Thread::GetWatchdogLock()
+dmq::RecursiveMutex& NuttXThread::GetWatchdogLock()
 {
     static dmq::RecursiveMutex* lock = new dmq::RecursiveMutex();
     return *lock;
 }
 
-void CmsisRtos2Thread::Run()
+//----------------------------------------------------------------------------
+// Run (Member Function Loop)
+//----------------------------------------------------------------------------
+void NuttXThread::Run()
 {
     bool selfExit = false;
     m_selfExitPtr = &selfExit;
 
     ThreadMsg* msg = nullptr;
-
     while (!selfExit && !m_exit.load())
     {
         dmq::Duration watchdogTimeout;
@@ -364,14 +391,14 @@ void CmsisRtos2Thread::Run()
             watchdogTimeout = m_watchdogTimeout.load();
         }
 
-        // If watchdog active, use a finite timeout so we can periodically update 
+        // If watchdog active, use a finite timeout so we can periodically update
         // m_lastAliveTime while idle. Otherwise, block forever to save power.
-        uint32_t waitOption = osWaitForever;
+        dmq::Duration waitOption = NuttXDelegateQueue::WAIT_FOREVER;
         if (watchdogTimeout.count() > 0)
         {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdogTimeout).count();
-            waitOption = static_cast<uint32_t>(ms / 4);
-            if (waitOption == 0) waitOption = 1;
+            waitOption = watchdogTimeout / 4;
+            if (waitOption <= dmq::Duration::zero())
+                waitOption = std::chrono::duration_cast<dmq::Duration>(std::chrono::milliseconds(1));
         }
 
         // Block for a message or timeout
@@ -381,19 +408,19 @@ void CmsisRtos2Thread::Run()
             int msgId = msg->GetId();
             if (msgId == MSG_DISPATCH_DELEGATE)
             {
-            #if defined(DMQ_DATABUS_TOOLS)
+#if defined(DMQ_DATABUS_TOOLS)
                 // Update latency stats before invoking
                 dmq::Duration latency = Timer::GetNow() - msg->GetEnqueueTime();
                 {
-                    osMutexAcquire(m_statMutex, osWaitForever);
+                    pthread_mutex_lock(&m_statMutex);
                     m_latencyTotalWindow += latency;
                     m_latencyCountWindow++;
                     if (latency > m_latencyMaxWindow) m_latencyMaxWindow = latency;
                     if (latency > m_latencyMaxAll) m_latencyMaxAll = latency;
                     m_dispatchCountAll++;
-                    osMutexRelease(m_statMutex);
+                    pthread_mutex_unlock(&m_statMutex);
                 }
-            #endif
+#endif
 
                 auto delegateMsg = msg->GetData();
                 DMQ_ASSERT_TRUE(delegateMsg);
@@ -442,12 +469,12 @@ void CmsisRtos2Thread::Run()
 #if defined(DMQ_DATABUS_TOOLS)
                 dmq::Duration invokeTime = Timer::GetNow() - start;
                 {
-                    osMutexAcquire(m_statMutex, osWaitForever);
+                    pthread_mutex_lock(&m_statMutex);
                     m_invokeTotalWindow += invokeTime;
                     m_invokeCountWindow++;
                     if (invokeTime > m_invokeMaxWindow) m_invokeMaxWindow = invokeTime;
                     if (invokeTime > m_invokeMaxAll) m_invokeMaxAll = invokeTime;
-                    osMutexRelease(m_statMutex);
+                    pthread_mutex_unlock(&m_statMutex);
                 }
 #endif
             }
@@ -460,10 +487,8 @@ void CmsisRtos2Thread::Run()
         }
     }
 
-    // Signal ExitThread() that we are done
-    if (m_exitSem) {
-        osSemaphoreRelease(m_exitSem);
-    }
+    // Signal that we are about to exit
+    sem_post(&m_exitSem);
     m_selfExitPtr = nullptr;
 }
 
@@ -471,9 +496,9 @@ void CmsisRtos2Thread::Run()
 //----------------------------------------------------------------------------
 // SnapshotStats
 //----------------------------------------------------------------------------
-CmsisRtos2Thread::ThreadStats CmsisRtos2Thread::SnapshotStats()
+NuttXThread::ThreadStats NuttXThread::SnapshotStats()
 {
-    osMutexAcquire(m_statMutex, osWaitForever);
+    pthread_mutex_lock(&m_statMutex);
     ThreadStats stats;
     stats.cpu_name = CPU_NAME;
     stats.thread_name = THREAD_NAME;
@@ -481,24 +506,24 @@ CmsisRtos2Thread::ThreadStats CmsisRtos2Thread::SnapshotStats()
     stats.queue_depth_max_window = m_queueDepthMaxWindow;
     stats.queue_depth_max_all = m_queueDepthMaxAll;
     stats.queue_size_limit = m_queueSize;
-    
+
     if (m_latencyCountWindow > 0) {
-        stats.latency_avg_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_latencyTotalWindow).count()) / (static_cast<float>(m_latencyCountWindow) * 1000.0f);
+        stats.latency_avg_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_latencyTotalWindow).count() / (static_cast<float>(m_latencyCountWindow) * 1000.0f);
     } else {
         stats.latency_avg_ms = 0.0f;
     }
 
-    stats.latency_max_window_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_latencyMaxWindow).count()) / 1000.0f;
-    stats.latency_max_all_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_latencyMaxAll).count()) / 1000.0f;
+    stats.latency_max_window_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_latencyMaxWindow).count() / 1000.0f;
+    stats.latency_max_all_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_latencyMaxAll).count() / 1000.0f;
 
     if (m_invokeCountWindow > 0) {
-        stats.invoke_avg_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_invokeTotalWindow).count()) / (static_cast<float>(m_invokeCountWindow) * 1000.0f);
+        stats.invoke_avg_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_invokeTotalWindow).count() / (static_cast<float>(m_invokeCountWindow) * 1000.0f);
     } else {
         stats.invoke_avg_ms = 0.0f;
     }
 
-    stats.invoke_max_window_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_invokeMaxWindow).count()) / 1000.0f;
-    stats.invoke_max_all_ms = static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(m_invokeMaxAll).count()) / 1000.0f;
+    stats.invoke_max_window_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_invokeMaxWindow).count() / 1000.0f;
+    stats.invoke_max_all_ms = (float)std::chrono::duration_cast<std::chrono::microseconds>(m_invokeMaxAll).count() / 1000.0f;
 
     stats.dispatch_count = m_dispatchCountAll;
 
@@ -512,7 +537,7 @@ CmsisRtos2Thread::ThreadStats CmsisRtos2Thread::SnapshotStats()
     m_invokeCountWindow = 0;
     m_invokeMaxWindow = Duration(0);
 
-    osMutexRelease(m_statMutex);
+    pthread_mutex_unlock(&m_statMutex);
     return stats;
 }
 #endif
