@@ -61,6 +61,8 @@
     #include "port/os/stdlib/StdlibThread.h"
 #elif defined(DMQ_THREAD_WIN32)
     #include "port/os/win32/Win32Thread.h"
+#elif defined(DMQ_THREAD_POSIX)
+    #include "port/os/posix/PosixThread.h"
 #elif defined(DMQ_THREAD_FREERTOS)
     #include "port/os/freertos/FreeRTOSThread.h"
 #elif defined(DMQ_THREAD_THREADX)
@@ -106,6 +108,15 @@ public:
     /// being ACKed — the message is now permanently abandoned.
     /// Subscribers receive: (peerName, remoteId, seqNum).
     dmq::Signal<void(const dmq::xstring&, dmq::DelegateRemoteId, uint16_t)> OnDeliveryFailed;
+
+    /// Fired on every per-attempt send status for a RELIABLE message to a peer
+    /// (TransportMonitor::OnSendStatus): SUCCESS when an ACK arrives, or TIMEOUT
+    /// on each retry attempt before the budget is exhausted. A message may report
+    /// TIMEOUT several times while still being retried before either succeeding
+    /// or finally firing OnDeliveryFailed once -- see OnDeliveryFailed for the
+    /// permanent-abandonment signal this is deliberately kept separate from.
+    /// Subscribers receive: (peerName, remoteId, seqNum, status).
+    dmq::Signal<void(const dmq::xstring&, dmq::DelegateRemoteId, uint16_t, TransportMonitor::Status)> OnPeerSendStatus;
 
     NetworkNode()  = default;
     ~NetworkNode() { Stop(); }
@@ -177,7 +188,6 @@ public:
             m_running = false;
 
             m_recvTimer.Stop();
-            m_recvConn.Disconnect();
             m_recvTransport.Close();
         }
 
@@ -190,6 +200,13 @@ public:
         if (m_thread)
             m_thread->ExitThread();
 
+        // Only safe to disconnect (and thereby free) the TimerDelegate now that
+        // ExitThread() above has fully drained m_thread's queue. m_recvTimer.Stop()
+        // only prevents NEW ticks -- a tick Timer::ProcessTimers() already fired on
+        // another thread just before Stop() ran may still be queued on m_thread,
+        // referencing this same TimerDelegate.
+        m_recvConn.Disconnect();
+
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         for (size_t i = m_peerCount; i > 0; --i) {
             RemoteNode& node = m_peers[i - 1];
@@ -201,6 +218,7 @@ public:
             node.capConn.Disconnect();
             node.pendingConn.Disconnect();
             node.deliveryFailedConn.Disconnect();
+            node.sendStatusConn.Disconnect();
             node.rawTransport.Close();
             node.active = false;
         }
@@ -221,8 +239,10 @@ public:
         DMQ_ASSERT_TRUE(m_peerCount < MaxPeers);
 
         RemoteNode& node = m_peers[m_peerCount];
-        strncpy(node.name, name, sizeof(node.name) - 1);
-        node.name[sizeof(node.name) - 1] = '\0';
+        size_t nameLen = strlen(name);
+        if (nameLen >= sizeof(node.name)) nameLen = sizeof(node.name) - 1;
+        memcpy(node.name, name, nameLen);
+        node.name[nameLen] = '\0';
 
         if (node.rawTransport.Create(Transport::Type::PUB, addr, port) != 0) {
             printf("NetworkNode: ERROR - failed to connect to peer '%s' at %s:%u\n", name, addr, port);
@@ -264,6 +284,16 @@ public:
                 printf("NetworkNode [%s]: delivery failed id=%u seq=%u (retries exhausted)\n",
                        peerName.c_str(), id, seq);
                 this->OnDeliveryFailed(peerName, id, seq);
+            }));
+        node.sendStatusConn = node.transportMonitor.OnSendStatus.Connect(
+            dmq::MakeDelegate([this, peerName](dmq::DelegateRemoteId id, uint16_t seq, TransportMonitor::Status status) {
+                // Only TIMEOUT is print-worthy here -- SUCCESS fires on every
+                // acked RELIABLE message and would flood the log under normal load.
+                if (status == TransportMonitor::Status::TIMEOUT) {
+                    printf("NetworkNode [%s]: send status TIMEOUT id=%u seq=%u (retry pending)\n",
+                           peerName.c_str(), id, seq);
+                }
+                this->OnPeerSendStatus(peerName, id, seq, status);
             }));
 
         node.reliableParticipant   = dmq::xmake_shared<Participant>(node.reliableTransport);
@@ -406,6 +436,7 @@ private:
         dmq::ScopedConnection capConn;
         dmq::ScopedConnection pendingConn;
         dmq::ScopedConnection deliveryFailedConn;
+        dmq::ScopedConnection sendStatusConn;
         std::shared_ptr<Participant> reliableParticipant;    // xmake_shared on construction
         std::shared_ptr<Participant> unreliableParticipant;  // xmake_shared on construction
         bool active = false;
