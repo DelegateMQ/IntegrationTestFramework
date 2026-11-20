@@ -9,3 +9,7 @@ add_library(Logger_ITLib STATIC ${SUBDIR_SOURCES} ${SUBDIR_HEADERS})
 
 # Include directories for the library
 target_include_directories(Logger_ITLib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+
+# Includes DelegateMQ.h
+target_link_libraries(Logger_ITLib PUBLIC DelegateMQ::DelegateMQ)

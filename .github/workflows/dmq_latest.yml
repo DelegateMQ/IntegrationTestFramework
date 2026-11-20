@@ -1,0 +1,33 @@
+name: DelegateMQ latest
+
+# Builds and tests against DelegateMQ's latest code instead of the pinned
+# release (DMQ_GIT_TAG in CMakeLists.txt), so a DelegateMQ change that would
+# break this framework shows up before the next DelegateMQ release. It only
+# reports: pull requests are checked by the pinned-release workflows.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays, 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      dmq_ref:
+        description: 'DelegateMQ branch or tag to build against'
+        required: false
+        default: 'master'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Configure CMake
+      run: cmake -S . -B build -DENABLE_IT=ON -DDMQ_GIT_TAG=${{ github.event.inputs.dmq_ref || 'master' }}
+
+    - name: Build
+      run: cmake --build build
+
+    - name: Run IntegrationTestFrameworkApp
+      run: ./build/IntegrationTestFrameworkApp

@@ -1,11 +1,9 @@
-# Collect all .cpp files in this subdirectory
-file(GLOB SUBDIR_SOURCES "*.cpp")
-
-# Collect all .h files in this subdirectory
-file(GLOB SUBDIR_HEADERS "*.h")
-
-# Create a library target
-add_library(PortLib STATIC ${SUBDIR_SOURCES} ${SUBDIR_HEADERS})
+# Port headers (Fault.h, IT_Client.h). Header-only: FaultHandler() is defined
+# by DelegateMQ's fault port.
+add_library(PortLib INTERFACE)
 
 # Include directories for the library
-target_include_directories(PortLib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(PortLib INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# IT_Client.h includes DelegateMQ.h
+target_link_libraries(PortLib INTERFACE DelegateMQ::DelegateMQ)
