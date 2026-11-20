@@ -55,17 +55,22 @@ This project implements an integration testing framework for multi-threaded C++ 
 * [IntegrationTestFrameworkDoctest](https://github.com/DelegateMQ/IntegrationTestFrameworkDoctest) - Integration test framework using Doctest and delegates.
 
 # Getting Started
-[CMake](https://cmake.org/) is used to create the project build files. See `CMakeLists.txt` for more information.
+[CMake](https://cmake.org/) 3.16 or newer is used to create the project build files. See `CMakeLists.txt` for more information.
 
 1. Clone the repository.
 2. From the repository root, run the following CMake command:   
-   `cmake -B Build . -DENABLE_IT=ON`
-3. Build and run the project within the `Build` directory. 
+   `cmake -B build . -DENABLE_IT=ON`
+3. Build and run the project within the `build` directory. 
+
+[DelegateMQ](https://github.com/DelegateMQ/DelegateMQ) is fetched from GitHub by CMake's `FetchContent` when CMake configures, at the release tag set by `DMQ_GIT_TAG` in `CMakeLists.txt` (currently `v2.4.1`), and the code links the `DelegateMQ::DelegateMQ` target. Options:
+
+* Another release: `cmake -B build . -DENABLE_IT=ON -DDMQ_GIT_TAG=<tag>`
+* A local DelegateMQ checkout instead of GitHub: `-DFETCHCONTENT_SOURCE_DIR_DELEGATEMQ=<path>`
+* No network after the first configure: `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`
 
 # Source Code
 The project contains the following directories:
 
-* **DelegateMQ** - the DelegateMQ library source code directory
 * **GoogleTest** - the Google Test library source code directory
 * **IntegrationTest** - the integration test framework source code
 * **Logger/it** - the Logger subsystem integration test source code

@@ -33,7 +33,9 @@ extern "C" {
 #define ASSERT_TRUE(condition) \
 	do {if (!(condition)) FaultHandler(__FILE__, (unsigned short) __LINE__);} while (0)
 
-	/// Handles all software assertions in the system.
+	/// Handles all software assertions in the system. Defined by DelegateMQ's fault
+	/// port (src/delegate-mq/port/fault/Fault.cpp), which prints the stack traces
+	/// and aborts.
 	/// @param[in] file - the file name that the software assertion occurred on
 	/// @param[in] line - the line number that the software assertion occurred on
 	DMQ_NORETURN void FaultHandler(const char* file, unsigned short line);
