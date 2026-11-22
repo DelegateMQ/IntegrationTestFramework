@@ -33,7 +33,7 @@ set(DMQ_SERIALIZE "DMQ_SERIALIZE_SERIALIZE")  # Set serialization support librar
 set(DMQ_TRANSPORT "DMQ_TRANSPORT_NONE")       # Set transport support library or none
 
 # DelegateMQ release to build against
-set(DMQ_GIT_TAG "v2.4.1" CACHE STRING "DelegateMQ release tag (or branch) to fetch")
+set(DMQ_GIT_TAG "v3.0.0" CACHE STRING "DelegateMQ release tag (or branch) to fetch")
 
 include(FetchContent)
 FetchContent_Declare(
